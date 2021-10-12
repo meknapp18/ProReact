@@ -1,0 +1,464 @@
+---
+title: "Path Analysis - ProReact"
+author: "Mike & Lindsey"
+date: "3/16/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Path Analysis Approach
+
+#load libraries. Install packages if necessary 
+```{r}
+library(psych)
+library(jmv)
+library(jmvcore)
+library(lavaan)
+library(DescTools)
+library(sandwich)
+library(jtools)
+library(ltm)
+library(semTools)
+library(psych)
+library(MVN)
+```
+
+#load data
+```{r}
+# read in data from Files and be sure to change Date from double to date (ha, double date)
+data <- readxl::read_excel('ProReact_724_New_check.xlsx')
+data.full <- readxl::read_excel('Proreact_724_full.xlsx')
+```
+
+#descriptives for full sample
+```{r}
+data.full[data.full == 999] <- NA
+data.full$Ethnicity <- as.factor(data.full$Ethnicity)
+descriptives(data.full, vars = c('Age', 'Gender', 'Ethnicity', 'Income', 'Political', 'US_City.State','AttentionCheck'), sd = TRUE, skew = TRUE, kurt = TRUE, freq = TRUE)
+View(data.full)
+```
+
+#Little's MCAR test
+```{r}
+mcar <- function(x){ 
+	if(!require(norm)) {
+		stop("You must have norm installed to use LittleMCAR") 
+	} 
+
+	# if(!require(data.table)) {
+	# 	stop("Please install the R-package data.table to use mcar")
+	# }
+
+	if(!(is.matrix(x) | is.data.frame(x))) {
+		stop("Data should be a matrix or dataframe")
+	}
+
+	if (is.data.frame(x)){
+		x <- data.matrix(x)
+	}
+
+	# delete rows of complete missingness
+	foo <- function(x) return(any(!is.na(x)))
+	dd <- apply(X = x, MARGIN = 1L, FUN = foo)
+	dd <- which(!dd, arr.ind = TRUE)
+	if(length(dd) > 0) 
+		x <- x[-dd,]
+
+	# define variables        
+	n.var <- ncol(x) # number of variables
+	n <- nrow(x)  #number of respondents
+	var.names <- colnames(x)
+	r <- 1 * is.na(x)
+
+	nmis <- as.integer(apply(r, 2, sum))  #number of missing data for each variable REWRITE
+	mdp <- (r %*% (2^((1:n.var - 1)))) + 1  #missing data patterns
+	x.mp <- data.frame(cbind(x,mdp)) # add column indicating pattern
+	colnames(x.mp) <- c(var.names,"MisPat") # set name of new column to MisPat
+	n.mis.pat <- length(unique(x.mp$MisPat)) # number of missing data patterns
+	p <- n.mis.pat-1 # number of Missing Data patterns minus 1 (complete data row)
+
+
+	s <- prelim.norm(x)
+	ll <- em.norm(s)
+	fit <- getparam.norm(s = s, theta = ll)
+
+	# gmean<-mlest(x)$muhat #ML estimate of grand mean (assumes Normal dist)
+	gmean <- fit$mu
+	# gcov<-mlest(x)$sigmahat #ML estimate of grand covariance (assumes Normal dist)
+	gcov <- fit$sigma
+	colnames(gcov) <- rownames(gcov) <- colnames(x)
+
+	#recode MisPat variable to go from 1 through n.mis.pat
+	x.mp$MisPat2 <- rep(NA,n)
+	for (i in 1:n.mis.pat){ 
+		x.mp$MisPat2[x.mp$MisPat == sort(unique(x.mp$MisPat), partial=(i))[i]]<- i 
+	}
+
+	x.mp$MisPat<-x.mp$MisPat2
+	x.mp<-x.mp[ , -which(names(x.mp) %in% "MisPat2")]
+
+	#make list of datasets for each pattern of missing data
+	datasets <- list() 
+	for (i in 1:n.mis.pat){
+		datasets[[paste("DataSet",i,sep="")]]<-x.mp[which(x.mp$MisPat==i),1:n.var]
+	}
+
+	#degrees of freedom
+	kj<-0
+	for (i in 1:n.mis.pat){	
+		no.na<-as.matrix(1* !is.na(colSums(datasets[[i]]))) 
+		kj<-kj+colSums(no.na) 
+	}
+
+	df<-kj -n.var
+
+	#Little's chi-square
+	d2<-0
+	cat("this could take a while")
+
+	# this crashes at the missingness pattern where every column is missing
+	# this for-loop can be handled faster with plyr-function
+	for (i in 1:n.mis.pat){	
+		mean <- (colMeans(datasets[[i]])-gmean) 
+		mean <- mean[!is.na(mean)] 
+		keep <- 1* !is.na(colSums(datasets[[i]])) 
+		keep <- keep[which(keep[1:n.var]!=0)] 
+		cov <- gcov 
+		cov <- cov[which(rownames(cov) %in% names(keep)) , which(colnames(cov) %in% names(keep))] 
+		d2 <- as.numeric(d2+(sum(x.mp$MisPat==i)*(t(mean)%*%solve(cov)%*%mean)))
+	}
+
+	#p-value for chi-square
+	p.value<-1-pchisq(d2,df)
+
+	#descriptives of missing data
+	amount.missing <- matrix(nmis, 1, length(nmis))
+	percent.missing <- amount.missing/n
+	amount.missing <- rbind(amount.missing,percent.missing)
+	colnames(amount.missing) <- var.names
+	rownames(amount.missing) <- c("Number Missing", "Percent Missing")
+
+	list(chi.square = d2, 
+	     df = df, 
+	     p.value = p.value, 
+	     missing.patterns = n.mis.pat, 
+	     amount.missing = amount.missing, 
+	     data = datasets)
+}
+
+# Taken from: https://stats-bayes.com/post/2020/08/14/r-function-for-little-s-test-for-data-missing-completely-at-random/
+```
+
+#data cleaning & creating variables for analysis
+```{r}
+# creating financial stress composite
+data$FinStress01 <- as.numeric(data$FinStress01)
+data$FinStress02 <- as.numeric(data$FinStress02)
+data$FinStress03 <- as.numeric(data$FinStress03)
+data$FinStress04 <- as.numeric(data$FinStress04)
+data$FinStress05 <- as.numeric(data$FinStress05)
+data$FinStress07 <- as.numeric(data$FinStress07)
+data$FinStress_Mean <- (data$FinStress01 + data$FinStress02 + data$FinStress03 + data$FinStress04 + data$FinStress05 + data$FinStress07)/6
+
+# changing main scale to numeric
+data$Mn_Salz_Reac <- as.numeric(data$Mn_Salz_Reac)
+data$Political <- as.numeric(data$Political)
+data$PSOC_Mean <- as.numeric(data$PSOC_Mean)
+data$FinStress_Mean <- as.numeric(data$FinStress_Mean)
+data$Biv_Restrict_Condition <- as.numeric(data$Biv_Restrict_Condition)
+data$Income <- as.numeric(data$Income)
+main.data.1 <- data[(data$Income) < 10, ]
+#data$Income <- plyr::revalue(data$Income, c("10" = 999))  
+
+
+demos <- main.data.1[c(1:8,10:20)]
+finaldat <- main.data.1[c(9, 21:241)]
+
+winsor.data <- finaldat[c(1, 207, 99, 218, 222, 212)]
+```
+
+#assessing missingness
+```{r}
+r <- mcar(winsor.data)
+
+r
+
+r[["amount.missing"]]
+```
+#removing those who failed the attention check
+#checking demographic descriptives
+#creating interaction term
+```{r}
+main.data.1$AttentionCheck <- plyr::revalue(main.data.1$AttentionCheck, c("2,4" = 1, "2" = 0))
+data.path <- subset(main.data.1, AttentionCheck == 1)
+
+descriptives(main.data.1, vars = c('Age', 'Gender', 'Ethnicity', 'Income', 'Political', 'US_City.State','AttentionCheck'), sd = TRUE, skew = TRUE, kurt = TRUE, freq = TRUE)
+
+data.path$Int_ResFin <- (data.path$Biv_Restrict_Condition*data.path$FinStress_Mean)
+```
+#check gender & creating binary "female" variable 
+```{r}
+descriptives(data.path, vars = c(
+  'Gender'), sd = TRUE, skew = TRUE, kurt = TRUE, freq = TRUE)
+
+data.path$Female <- data.path$Gender #created a new variable where I have copied over Gender responses
+data.path$Female <- as.factor(data.path$Female)
+data.path$Female <- as.numeric(plyr::revalue(data.path$Female, c("1" = 1, "2" = 0, "3" = 0, "4" = 0, "5" = 0, "6" = 999)))
+data.path[data.path == 999] <- NA
+class(data.path$Female) 
+
+data.path$Female <- dplyr::recode(data.path$Female, '1' = 1L, '2' = 0L)
+class(data.path$Female)#still numeric!
+View(data.path)#now 0s and 1s!
+
+#descriptives for whole sample
+descriptives(data.path, vars = c(
+  'Female', 
+  'Gender'), sd = TRUE, skew = TRUE, kurt = TRUE, freq = TRUE)
+#checking that re-value worked correctly 
+```
+
+```{r}
+corrMatrix(data.path, vars = c('Mn_Salz_Reac', 'Biv_Restrict_Condition', 'FinStress_Mean', 'PSOC_Mean', 'Political', 'Income', 'PanResp04', 'Female'), flag = TRUE)
+```
+
+#correlation matrix subsetted by restriction condition
+```{r}
+data.path.self <- subset(data.path, Biv_Restrict_Condition == 0)
+data.path.comm <- subset(data.path, Biv_Restrict_Condition == 1)
+
+
+corrMatrix(data = data.path.comm, 
+           vars = c('Mn_Salz_Reac', 'FinStress_Mean', 'PSOC_Mean', 'Political', 'Income', 'PanResp04', 'Female'),
+           pearson = TRUE,
+           sig = TRUE,
+           flag = TRUE)
+
+corrMatrix(data = data.path.self, 
+           vars = c('Mn_Salz_Reac', 'FinStress_Mean', 'PSOC_Mean', 'Political', 'Income', 'PanResp04', 'Female'),
+           pearson = TRUE,
+           sig = TRUE,
+           flag = TRUE)
+```
+
+
+#more data cleaning and analysis-specific descriptives
+```{r}
+descriptives(data.path, vars = c('Mn_Salz_Reac', 'Biv_Restrict_Condition', 'FinStress_Mean', 'PSOC_Mean', 'Political', 'Income', 'PanResp04', 'AttentionCheck', 'Female'), sd = TRUE, skew = TRUE, kurt = TRUE)
+data.path[data.path == 999] <- NA
+data.path$Ethnicity <- as.factor(data.path$Ethnicity)
+data.path$US_City.State <- as.factor(data.path$US_City.State)
+
+descriptives(data.path, vars = c('Age', 'Gender', 'Ethnicity', 'Income', 'Political', 'US_City.State','AttentionCheck'), sd = TRUE, skew = TRUE, kurt = TRUE, freq = TRUE)
+
+descriptives(data, vars = c('Age', 'Gender', 'Ethnicity', 'Income', 'Political', 'US_City.State', 'AttentionCheck'), sd = TRUE, skew = TRUE, kurt = TRUE, freq = TRUE)
+
+View(data.path)
+hist(data.path$PanResp04)
+```
+
+#checking multivariate normality 
+```{r}
+data.mv.out <- data.path[c('Mn_Salz_Reac', 'Biv_Restrict_Condition', 'FinStress_Mean', 'PSOC_Mean', 'Political', 'Income', 'PanResp04', "Female")]
+
+mvn(data.mv.out, mvnTest = 'mardia', showOutliers = TRUE)
+```
+
+#t-tests for randomization check
+```{r}
+ttestIS(formula = FinStress_Mean ~ Biv_Restrict_Condition, data = data.path, ci = TRUE, ciWidth = 95, eqv = TRUE)
+ttestIS(formula = PSOC_Mean ~ Biv_Restrict_Condition, data = data.path, ci = TRUE,ciWidth = 95, eqv = TRUE)
+ttestIS(formula = Income ~ Biv_Restrict_Condition, data = data.path, ci = TRUE,ciWidth = 95, eqv = TRUE)
+ttestIS(formula = PanResp04 ~ Biv_Restrict_Condition, data = data.path, ci = TRUE,ciWidth = 95, eqv = TRUE)
+ttestIS(formula = Female ~ Biv_Restrict_Condition, data = data.path, ci = TRUE,ciWidth = 95, eqv = TRUE)
+results <- ttestIS(formula = Political ~ Biv_Restrict_Condition, data = data.path, ci = TRUE, ciWidth = 95, ciES = TRUE, ciWidthES = 95) #eqv = TRUE)
+results
+
+descriptives(data = data.path, vars = 'Political', splitBy = 'Biv_Restrict_Condition', mean = TRUE, sd = TRUE, range = TRUE, min = TRUE, max = TRUE)
+```
+
+#t-tests again to get confidence intervals. JMV doesn't want to play nice with CIs for some reason so doing it old school
+```{r}
+
+t.test(data.path$Political ~ data.path$Biv_Restrict_Condition, var.equal=TRUE, paired = FALSE, conf.level = 0.95)
+t.test(data.path$PanResp04 ~ data.path$Biv_Restrict_Condition, var.equal=FALSE, paired = FALSE, conf.level = 0.95)
+```
+
+#fancy Cronbach's for reliability 
+```{r}
+library(ltm)
+
+cron.PSOC <- data.path[c("PSOC01", "PSOC02", "PSOC03", "PSOC04")]
+cronbach.alpha(cron.PSOC, CI = TRUE, B = 1000, na.rm = TRUE)
+
+cron.FinStress <- data.path[c("FinStress01", "FinStress02", "FinStress03", "FinStress04", "FinStress05", "FinStress07")]
+cronbach.alpha(cron.FinStress, CI = TRUE, B = 1000, na.rm = TRUE)
+
+cron.Salz <- data.path[c("Salz_adapt_04", "R_Salz_adapt_05", "Salz_adapt_06", "Salz_adapt_07", "Salz_adapt_08", "Salz_adapt_09", "R_Salz_adpt_10", "R_Salz_adapt_11", "Salz_adapt_12", "Salz_adapt_13", "Salz_adapt_14")]
+cronbach.alpha(cron.Salz, CI = TRUE, B = 1000, na.rm = TRUE)
+```
+
+#Main analysis
+#path analysis with interaction term
+```{r}
+socdist.fem <- '
+  # Regressions
+  Mn_Salz_Reac ~ Biv_Restrict_Condition + FinStress_Mean + PSOC_Mean + Political + Income + Int_ResFin + Female
+  PanResp04 ~ Mn_Salz_Reac 
+
+  # Variances
+  Mn_Salz_Reac~~Mn_Salz_Reac
+  Biv_Restrict_Condition~~Biv_Restrict_Condition
+  FinStress_Mean~~FinStress_Mean
+  PSOC_Mean~~PSOC_Mean
+  Political~~Political
+  Income~~Income
+  PanResp04~~PanResp04
+  Female ~~Female
+
+  # Covariances#
+  Biv_Restrict_Condition~~Political
+  FinStress_Mean~~Income
+  Int_ResFin~~Biv_Restrict_Condition
+  Int_ResFin~~FinStress_Mean
+'
+  
+fit.socdist.fem <- sem(socdist.fem, data = data.path, 
+                       estimator = 'MLR', 
+                       missing = 'FIML') 
+                       
+summary(fit.socdist.fem, fit.measures = TRUE, standardized = TRUE)
+```
+#confidence intervals & comprehensive fit indices
+```{r}
+fitCI <- parameterEstimates(fit.socdist.fem, se = TRUE, zstat = TRUE, pvalue = TRUE, ci = TRUE)
+fitCI
+
+inspect(fit.socdist.1, "fem")
+inspect(fit.socdist.1,"fem")
+```
+#standardized solution (betas & standard error) for figure
+```{r}
+
+stan.socdist.fem <- standardizedSolution(fit.socdist.fem, type = "std.all", se = TRUE, pvalue = TRUE, ci = TRUE, level = 0.95)
+stan.socdist.fem
+
+```
+
+#RMSEA: Test of Close Fit for social distancing model
+```{r}
+df<- 24 
+N <- 301
+
+#test of close fit
+#null hypothesis: model has good fit
+#alternative hypothesis: model does not have good fit
+RMSEA.c <- .05
+ncp <- RMSEA.c^2*(N-1)*df
+crit.val <- qchisq(.95, df = df, ncp = ncp)
+crit.val
+#crit.val for RMSEA .05= 61.38134
+
+
+#need to calculate Tm for df = 24 & N = 301
+inspect(fit.socdist.fem, "fit")
+inspect(fit.socdist.fem, "fit")["fmin"]
+fmin <- 0.08139221
+Tm <- inspect(fit.socdist.fem, "fit")["fmin"]*2*301
+Tm
+#Tm = 51.45804 
+Tm.log <- -2*(inspect(fit.socdist.fem, "fit")["logl"] - inspect(fit.socdist.gen, "fit")["unrestricted.logl"])
+Tm.log
+
+#critical value for RMSEA = .05 is higher than Tm value = 48.99811, so we retain the null hypothesis of close fit
+```
+
+
+#Test of Not close fit for social distancing model
+```{r}
+#test of not-close fit
+#Null hypothesis: model has bad fit
+#alternative hypothesis: model does not have bad fit
+
+
+RMSEA.c.notclose <- .11
+ncp.notclose <- RMSEA.c.notclose^2*(N-1)*df
+crit.val.notclose <- qchisq(.95, df = df, ncp = ncp.notclose, lower.tail = FALSE)
+crit.val.notclose
+#critical value for not close RMSEA .11 = 80.0842
+
+
+#Tm = 48.99811
+
+#critical value for not close fit is greater than Tm value of 48.99811, so we reject the null hypothesis that the model has bad fit. 
+```
+
+#probing the interaction
+#simple slopes
+```{r}
+# Looking at the interaction between financial stress and restriction condition at a low, average, and high level of financial stress. The difference between self and community focus depends upon the level of financial stress, such that high level of stress is related to lower levels of reactance in the community condition. There is not a difference between conditions when financial stress is at a low or average level.
+twowayslopes <- probe2WayMC(fit.socdist.fem, nameX = c('Biv_Restrict_Condition', 'FinStress_Mean', 'Int_ResFin'), nameY = 'Mn_Salz_Reac', modVar = 'FinStress_Mean', valProbe = c(0.77,1.49,2.21))
+twowayslopes
+plotProbe(twowayslopes, xlim = c(0,1), ylab = "State Reactance", xlab = "Restriction Condition", legend = TRUE, legendArgs= list(title = 'Financial Stress'))
+
+twowayslopes2 <- probe2WayMC(fit.socdist.fem, nameX = c('Biv_Restrict_Condition', 'FinStress_Mean', 'Int_ResFin'), nameY = 'Mn_Salz_Reac', modVar = 'Biv_Restrict_Condition', valProbe = c(0, 1))
+twowayslopes2
+plotProbe(twowayslopes2, xlim = c(1,5), ylab = "State Reactance", xlab = "Financial Stress", legend = TRUE, legendArgs= list(title = 'Restriction Condition'))
+
+```
+#graphing simple slopes in a visually appealing way 
+```{r}
+path.lm2 <- lm(  Mn_Salz_Reac ~ Biv_Restrict_Condition + FinStress_Mean + PSOC_Mean + Political + Income + Gender + Biv_Restrict_Condition*FinStress_Mean, data = data.path)
+path.lm2
+QuantPsyc::lm.beta(path.lm2)
+path.lm2
+
+interactions::interact_plot(path.lm2, pred = FinStress_Mean, modx = Biv_Restrict_Condition,
+              x.label = "Financial Stress", y.label = "State Reactance", legend.main = "Restriction Condition", modx.labels = c('Self', 'Community'))
+
+
+interactions::sim_slopes(path.lm2, pred = FinStress_Mean, modx = Biv_Restrict_Condition)
+
+interactions::sim_slopes(path.lm2, pred = Biv_Restrict_Condition, modx = FinStress_Mean)
+
+interactions::interact_plot(path.lm2, pred = Biv_Restrict_Condition, modx = FinStress_Mean,
+              x.label = "Condition", y.label = "State Reactance")
+
+summ(path.lm2)
+probe_interaction(path.lm2, pred = Biv_Restrict_Condition, modx = FinStress_Mean, cond.int = TRUE,interval = TRUE,jnplot = TRUE)
+
+probe_interaction(path.lm2, pred = FinStress_Mean, modx = Biv_Restrict_Condition, cond.int = TRUE,
+                  interval = TRUE,  jnplot = TRUE, control.fdr = TRUE, alpha = .01)
+
+
+p2 <- interact_plot(path.lm2, pred = FinStress_Mean, modx = Biv_Restrict_Condition, modx.values = NULL, interval = TRUE,
+                   x.label = "Financial Stress",
+                   y.label = "State Reactance", legend.main = "Restriction Condition", 
+                   modx.labels = c('Self', 'Community'),
+                   line.thickness = 1.25, colors = "Qual2", vary.lty = FALSE, plot.points = T, jitter = 0.1, point.size = 2)
+
+p2
+
+ss2 <- sim_slopes(path.lm2, pred = Biv_Restrict_Condition, modx = FinStress_Mean)
+plot(ss2)
+
+p.flip2 <- interact_plot(path.lm, pred = Biv_Restrict_Condition, modx = FinStress_Mean, modx.values = NULL, interval = TRUE,
+                   x.label = "Restriction Condition",
+                   y.label = "State Reactance", legend.main = "Financial Stress", 
+                   pred.labels = c('Self-Focused', 'Community-Focused'),
+                   modx.labels = c('Low Financial Stress (-1 SD)', 'Mean Financial Stress', 'High Financial Stress (+1 SD)'),
+                   line.thickness = 1.25, colors = "Qual2", vary.lty = FALSE, plot.points = T, jitter = 0.1, point.size = 2)
+
+p.flip2
+```
+
+
+
+
+
+
+
+
